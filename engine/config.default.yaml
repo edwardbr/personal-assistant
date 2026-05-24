@@ -1,0 +1,85 @@
+# All ${VAR} and ${VAR:-default} references below are expanded against the
+# bridge process's environment before YAML parsing. Override any field by
+# setting the env var in the systemd unit (or wherever the bridge launches):
+#
+#   systemctl --user edit whisper-strix-halo.service
+#   [Service]
+#   Environment=LLAMA_URL=http://other-host:5555/v1/chat/completions
+#
+# To change wake phrases or add new agents, edit this file (or copy to
+# ~/.config/whisper-bridge/config.yaml — the bridge prefers that path if present).
+
+mode: ${BRIDGE_MODE:-wake_word}    # wake_word | vad_continuous | push_to_talk
+
+whisper:
+  url: ${WHISPER_BRIDGE_URL:-http://127.0.0.1:8771}
+  path: ${WHISPER_INFERENCE_PATH:-/v1/audio/transcriptions}
+  language: ${WHISPER_LANG:-en}
+  threads: ${WHISPER_THREADS:-8}
+  translate: false
+
+audio:
+  device: ${AUDIO_DEVICE:-default}   # PortAudio device name or index; "default" = system default
+  sample_rate: 16000
+  vad_aggressiveness: 2              # 0-3, higher = more aggressive at filtering non-speech
+  silence_ms: 600                    # trailing silence that ends a segment
+  min_speech_ms: 300
+
+wake_word_options:
+  fuzzy: true                        # also match "hey, hermes" / "a hermes" / etc.
+  ack_beep: true
+  command_timeout_sec: 12
+  print_response: true
+
+# Each wake phrase routes to a named agent below.
+# First wake word matched in a transcript wins; the rest of the segment (or the next
+# spoken utterance, if the wake word was alone) goes to that agent.
+wake_words:
+  # Each entry can use `phrase: "..."` (single) or `phrases: [...]` (list of aliases).
+  # Whisper often mishears proper nouns; alias-list keeps misfires low.
+  - phrases:
+      - "hey hermes"
+      - "hey hermez"
+      - "hey her mes"
+      - "hey hermies"
+      - "hey her miss"
+      - "hey her meez"
+    agent: hermes
+  - phrases:
+      - "hey llama"
+      - "hey lama"
+      - "hey lamma"
+      - "hey llamma"
+      - "hey llamas"
+      - "hey lamas"
+    agent: llama
+
+tts:
+  enabled: ${TTS_ENABLED:-true}
+  voice_path: ${TTS_VOICE_PATH:-~/Models/tts/en/en_GB/alba/medium/en_GB-alba-medium.onnx}
+  # Sample rate is auto-read from the voice's .onnx.json; no need to set it here.
+
+default_agent: ${DEFAULT_AGENT:-hermes}
+
+agents:
+  hermes:
+    # Point at any OpenAI /v1/chat/completions endpoint. Set HERMES_URL to override.
+    url: ${HERMES_URL:-http://REPLACE_ME:PORT/v1/chat/completions}
+    model: ${HERMES_MODEL:-auto}     # "auto" -> first model from <base>/v1/models
+    # If the endpoint requires auth (llama.cpp --api-key, vLLM, hosted providers),
+    # set HERMES_API_KEY and it'll be sent as `Authorization: Bearer <key>`.
+    api_key: ${HERMES_API_KEY:-}
+    system_prompt: |
+      You are Hermes, a fast voice-controlled assistant. Reply in one or two sentences
+      unless the user explicitly asks for more.
+    max_tokens: 256
+    temperature: 0.7
+
+  llama:
+    url: ${LLAMA_URL:-http://127.0.0.1:3001/v1/chat/completions}
+    model: ${LLAMA_MODEL:-auto}
+    api_key: ${LLAMA_API_KEY:-}      # set if llama.cpp was started with --api-key
+    system_prompt: |
+      You are the local llama.cpp assistant. Reply briefly.
+    max_tokens: 256
+    temperature: 0.7

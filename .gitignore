@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Logs (build/runtime artifacts from engine)
+*.log
+
+# Claude Code local settings (per-user, machine-specific)
+.claude/settings.local.json

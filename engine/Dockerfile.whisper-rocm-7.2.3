@@ -1,0 +1,166 @@
+# whisper-strix-halo:rocm-7.2.3
+#
+# whisper.cpp + "hey hermes" voice bridge, tuned for AMD Strix Halo (gfx1151).
+# Hybrid of kyuz0's amd-strix-halo-toolboxes:rocm-7.2.3 Dockerfile (Fedora 43 + ROCm 7.2.3
+# build chain) with the whisper.cpp source tree in place of llama.cpp.
+#
+# Required host paths (auto-mounted by toolbox via $HOME bind):
+#   ~/Models/whisper-stt/ggml-*.bin   speech-to-text models (NOT ~/Models/Whisper/, which is an LLM)
+#   ~/.cache/huggingface/token        used by huggingface_hub for authenticated model fetches
+#
+# Required toolbox launch flags (see create-toolbox.sh):
+#   --device /dev/dri --device /dev/kfd  --device /dev/snd
+#   --group-add video --group-add render --group-add audio --group-add sudo
+#   --security-opt seccomp=unconfined
+#
+# Runtime entry: `whisper-toolbox-start` starts whisper-server on :8771 and the bridge.
+# Web UI:        http://localhost:8771/  (whisper.cpp built-in demo page)
+# Agent target:  configured in /etc/whisper-bridge/config.yaml (default http://127.0.0.1:3001)
+
+# build stage
+FROM registry.fedoraproject.org/fedora:43 AS builder
+
+# rocm 7.2.3 repo
+RUN <<'EOF'
+tee /etc/yum.repos.d/rocm.repo <<REPO
+[ROCm-7.2.3]
+name=ROCm7.2.3
+baseurl=https://repo.radeon.com/rocm/rhel10/7.2.3/main
+enabled=1
+priority=50
+gpgcheck=1
+gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
+REPO
+EOF
+
+# build + audio deps (SDL2 for whisper-stream/server mic, curl for model dl).
+# Cache mounts keep the ROCm rpms across rebuilds so package-list edits don't re-pull 1.5GB.
+RUN --mount=type=cache,target=/var/cache/libdnf5,sharing=locked \
+    --mount=type=cache,target=/var/cache/dnf,sharing=locked \
+    dnf -y --nodocs --setopt=install_weak_deps=False --setopt=keepcache=True \
+  --exclude='*sdk*' --exclude='*samples*' --exclude='*-doc*' --exclude='*-docs*' \
+  install \
+    make gcc gcc-c++ cmake lld clang clang-devel compiler-rt libcurl-devel ninja-build \
+    rocm-llvm rocm-device-libs hip-runtime-amd hip-devel \
+    rocblas rocblas-devel hipblas hipblas-devel rocm-cmake libomp-devel libomp \
+    rocminfo radeontop \
+    SDL2-devel \
+    git-core vim sudo rsync patch curl
+
+# rocm env (mirrors kyuz0)
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    HIP_CLANG_PATH=/opt/rocm/llvm/bin \
+    HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode \
+    PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
+
+# whisper.cpp
+WORKDIR /opt/whisper.cpp
+ARG REPO=https://github.com/ggerganov/whisper.cpp.git
+ARG BRANCH=master
+RUN git clone -b ${BRANCH} --single-branch --recursive ${REPO} .
+
+# build whisper.cpp with HIP for gfx1151 + SDL2 (server/stream)
+RUN cmake -S . -B build -G Ninja \
+      -DGGML_HIP=ON \
+      -DCMAKE_HIP_FLAGS="--rocm-path=/opt/rocm -mllvm --amdgpu-unroll-threshold-local=600" \
+      -DAMDGPU_TARGETS=gfx1151 \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=ON \
+      -DROCM_PATH=/opt/rocm \
+      -DHIP_PATH=/opt/rocm \
+      -DHIP_PLATFORM=amd \
+      -DWHISPER_SDL2=ON \
+      -DWHISPER_BUILD_TESTS=OFF \
+      -DWHISPER_BUILD_EXAMPLES=ON \
+ && cmake --build build --config Release -j$(nproc) \
+ && cmake --install build --config Release
+
+# keep the model-download script available so users can pull extras into ~/Models/whisper-stt
+RUN install -m 0755 ./models/download-ggml-model.sh /usr/local/bin/whisper-download-model
+
+# stash example assets for the demo page
+RUN mkdir -p /opt/whisper-extras/samples \
+ && cp -a samples/. /opt/whisper-extras/samples/ 2>/dev/null || true
+
+# runtime stage
+FROM registry.fedoraproject.org/fedora-minimal:43
+
+# rocm 7.2.3 repo (so users can dnf install more rocm packages if needed)
+RUN <<'EOF'
+tee /etc/yum.repos.d/rocm.repo <<REPO
+[ROCm-7.2.3]
+name=ROCm7.2.3
+baseurl=https://repo.radeon.com/rocm/rhel10/7.2.3/main
+enabled=1
+priority=50
+gpgcheck=1
+gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
+REPO
+EOF
+
+# runtime deps: rocm libs + audio client (PipeWire/Pulse) + python for the bridge.
+# python3-setuptools is required because webrtcvad imports pkg_resources at runtime
+# (Python 3.14 + fedora-minimal don't ship setuptools by default).
+# gcc/gcc-c++/python3-devel let users pip install other C-extension packages later;
+# they also enable the webrtcvad wheel build in the pip step below.
+RUN --mount=type=cache,target=/var/cache/libdnf5,sharing=locked \
+    --mount=type=cache,target=/var/cache/dnf,sharing=locked \
+    microdnf -y --nodocs --setopt=install_weak_deps=0 --setopt=keepcache=True \
+  --exclude='*sdk*' --exclude='*samples*' --exclude='*-doc*' --exclude='*-docs*' \
+  install \
+    bash ca-certificates libatomic libstdc++ libgcc libgomp sudo \
+    hip-runtime-amd rocblas hipblas \
+    rocminfo radeontop procps-ng \
+    SDL2 \
+    pipewire-libs pipewire-pulseaudio pulseaudio-libs pulseaudio-utils alsa-lib alsa-utils portaudio \
+    python3 python3-pip python3-numpy python3-devel python3-setuptools \
+    gcc gcc-c++ \
+    git-core \
+    curl jq vim-minimal
+
+# python deps for the wake-word bridge (Fedora 43 ships PEP 668 markers).
+# webrtcvad builds a C extension at install time -> needs gcc + python3-devel above.
+# huggingface_hub reads ~/.cache/huggingface/token from the host bind to auth model fetches.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    python3 -m pip install --break-system-packages \
+      sounddevice==0.5.1 \
+      webrtcvad==2.0.10 \
+      requests==2.32.3 \
+      pyyaml==6.0.2 \
+      huggingface_hub==0.27.1 \
+      piper-tts==1.4.2
+
+# copy built binaries, libs, headers, and helper scripts
+# Models live on the host at ~/Models/whisper-stt/ (auto-mounted by toolbox), not inside the image
+COPY --from=builder /usr/local/      /usr/local/
+COPY --from=builder /opt/whisper-extras /opt/whisper-extras
+
+# ldconfig for shared libs (mirrors kyuz0)
+RUN echo "/usr/local/lib"   > /etc/ld.so.conf.d/local.conf \
+ && echo "/usr/local/lib64" >> /etc/ld.so.conf.d/local.conf \
+ && ldconfig
+
+# bridge + entrypoint
+COPY bridge.py            /usr/local/lib/whisper-bridge/bridge.py
+COPY entrypoint.sh        /usr/local/bin/whisper-toolbox-start
+COPY config.default.yaml  /etc/whisper-bridge/config.yaml
+RUN chmod +x /usr/local/bin/whisper-toolbox-start
+
+# rocm env for interactive shells
+RUN printf 'export ROCM_PATH=/opt/rocm\nexport HIP_PATH=/opt/rocm\nexport PATH=/opt/rocm/bin:$PATH\n' \
+      > /etc/profile.d/rocm.sh \
+ && chmod +x /etc/profile.d/rocm.sh \
+ && echo 'source /etc/profile.d/rocm.sh' >> /etc/bashrc
+
+LABEL org.opencontainers.image.title="whisper-strix-halo" \
+      org.opencontainers.image.description="whisper.cpp + hey-hermes voice bridge for Strix Halo (gfx1151), ROCm 7.2.3" \
+      org.opencontainers.image.source="https://github.com/kyuz0/amd-strix-halo-toolboxes (Dockerfile.rocm-7.2.3, forked)" \
+      org.opencontainers.image.vendor="local" \
+      org.opencontainers.image.licenses="MIT"
+
+# Reports healthy once whisper-toolbox-start has whisper-server listening on :8771.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -sf http://127.0.0.1:8771/ >/dev/null || exit 1
+
+CMD ["/bin/bash"]

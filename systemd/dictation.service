@@ -1,0 +1,17 @@
+[Unit]
+Description=Push-to-talk dictation (Right-Ctrl) -> whisper-server -> ydotool
+After=whisper-strix-halo.service ydotoold.service graphical-session.target
+Wants=whisper-strix-halo.service ydotoold.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=WHISPER_URL=http://127.0.0.1:8771/v1/audio/transcriptions
+Environment=YDOTOOL_SOCKET=%t/.ydotool_socket
+ExecStart=%h/projects/personal-assistant/daemon/.venv/bin/python %h/projects/personal-assistant/daemon/dictation.py
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=15
+
+[Install]
+WantedBy=graphical-session.target

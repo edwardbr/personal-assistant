@@ -1,0 +1,31 @@
+[Unit]
+Description=Whisper STT toolbox (whisper-server on :8771, optional wake-word bridge)
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Server only by default. To also run the bridge (hey-hermes / hey-llama wake words):
+#   systemctl --user edit whisper-strix-halo.service
+# and add: Environment=WHISPER_RUN_BRIDGE=1
+Environment=WHISPER_RUN_BRIDGE=0
+Environment=WHISPER_MODEL=%h/Models/whisper-stt/ggml-large-v3-turbo.bin
+
+# `toolbox run` exec's into podman; we need to wait on the container's process, so use podman exec directly.
+ExecStartPre=/usr/bin/podman start whisper-rocm-7.2.3
+ExecStart=/bin/sh -c '\
+  if [ "$WHISPER_RUN_BRIDGE" = "1" ]; then \
+    exec /usr/bin/podman exec -i whisper-rocm-7.2.3 whisper-toolbox-start ; \
+  else \
+    exec /usr/bin/podman exec -i whisper-rocm-7.2.3 \
+      whisper-server \
+        -m "$WHISPER_MODEL" \
+        --host 0.0.0.0 --port 8771 --threads 8 \
+        --inference-path /v1/audio/transcriptions ; \
+  fi'
+ExecStop=/usr/bin/podman exec whisper-rocm-7.2.3 sh -c 'pkill -TERM -f whisper-server; pkill -TERM -f bridge.py; true'
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+
+[Install]
+WantedBy=default.target

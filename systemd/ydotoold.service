@@ -1,0 +1,11 @@
+[Unit]
+Description=ydotoold user keystroke injection daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ydotoold --socket-path=%t/.ydotool_socket --socket-own=%U:%U
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
