@@ -146,6 +146,7 @@ RUN echo "/usr/local/lib"   > /etc/ld.so.conf.d/local.conf \
 
 # bridge + entrypoint
 COPY bridge.py            /usr/local/lib/whisper-bridge/bridge.py
+COPY local_mcp_server.py  /usr/local/lib/whisper-bridge/local_mcp_server.py
 COPY entrypoint.sh        /usr/local/bin/whisper-toolbox-start
 COPY config.default.yaml  /etc/whisper-bridge/config.yaml
 RUN chmod +x /usr/local/bin/whisper-toolbox-start

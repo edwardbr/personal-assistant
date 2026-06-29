@@ -315,7 +315,14 @@ def handle_assistant_audio(pcm: bytes) -> None:
     speak_text(answer)
 
 
-TYPE_BACKEND = os.environ.get("DICTATION_TYPER", "auto").lower()  # auto | wtype | ydotool | clipboard
+TYPE_BACKEND = os.environ.get("DICTATION_TYPER", "auto").lower()  # auto | direct | wtype | ydotool | clipboard
+ALLOW_CLIPBOARD_FALLBACK = os.environ.get("DICTATION_ALLOW_CLIPBOARD_FALLBACK", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+PASTE_KEYS = os.environ.get("DICTATION_PASTE_KEYS", "ctrl_v").lower().replace("-", "_")
 ENABLE_BEEPS = os.environ.get("DICTATION_BEEPS", "1") not in ("0", "false", "no", "off")
 BEEP_VOLUME = float(os.environ.get("DICTATION_BEEP_VOLUME", "0.15"))
 DICTATION_SOCKET_PATH = Path(
@@ -367,6 +374,7 @@ def _try_wtype(text: str) -> bool:
         return False
     try:
         subprocess.run(["wtype", "--", text], check=True, timeout=30)
+        LOG.info("typed with wtype")
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         LOG.warning("wtype failed: %s", e)
@@ -382,17 +390,39 @@ def _try_ydotool(text: str) -> bool:
     try:
         subprocess.run(["ydotool", "type", f"--key-delay={TYPE_DELAY_MS}", "--", text],
                        check=True, timeout=30)
+        LOG.info("typed with ydotool")
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         LOG.warning("ydotool failed: %s", e)
         return False
 
 
-def _try_clipboard(text: str) -> bool:
-    """Copy to clipboard and synthesize a paste keystroke. Layout-agnostic.
-    Uses Ctrl+Shift+V (terminal-style) first since it works in both terminals and
-    most GTK/Qt apps; falls back to Ctrl+V if Shift+Insert / Ctrl+Shift+V fails.
+def _paste_key_sequence(mode: str) -> Optional[list[str]]:
+    """Return ydotool key events for a paste shortcut.
+
+    29=LeftCtrl, 42=LeftShift, 47=v, 110=Insert. Keycodes are layout-independent.
     """
+    aliases = {
+        "gui": "ctrl_v",
+        "editor": "ctrl_v",
+        "text_editor": "ctrl_v",
+        "terminal": "ctrl_shift_v",
+        "ctrl_shift": "ctrl_shift_v",
+        "shift_ctrl_v": "ctrl_shift_v",
+        "shift_insert": "shift_insert",
+    }
+    mode = aliases.get(mode, mode)
+    if mode == "ctrl_v":
+        return ["29:1", "47:1", "47:0", "29:0"]
+    if mode == "ctrl_shift_v":
+        return ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
+    if mode == "shift_insert":
+        return ["42:1", "110:1", "110:0", "42:0"]
+    return None
+
+
+def _try_clipboard(text: str) -> bool:
+    """Copy to clipboard and synthesize a paste keystroke. Layout-agnostic."""
     if not shutil.which("wl-copy"):
         LOG.error("wl-copy not installed; cannot use clipboard backend (sudo rpm-ostree install wl-clipboard)")
         return False
@@ -401,14 +431,21 @@ def _try_clipboard(text: str) -> bool:
     except Exception as e:
         LOG.error("wl-copy failed: %s", e)
         return False
-    # Try ydotool key for Ctrl+Shift+V (29=LeftCtrl, 42=LeftShift, 47=v) — keycodes are layout-independent
+    sequence = _paste_key_sequence(PASTE_KEYS)
+    if sequence is None:
+        LOG.error(
+            "unknown DICTATION_PASTE_KEYS=%r (use: ctrl_v|ctrl_shift_v|shift_insert)",
+            PASTE_KEYS,
+        )
+        return True
+
     if shutil.which("ydotool"):
         try:
-            subprocess.run(["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
-                           check=True, timeout=5)
+            subprocess.run(["ydotool", "key", *sequence], check=True, timeout=5)
+            LOG.info("clipboard pasted with %s", PASTE_KEYS)
             return True
         except Exception as e:
-            LOG.warning("ydotool Ctrl+Shift+V failed: %s; transcript is still on clipboard for manual paste", e)
+            LOG.warning("ydotool paste key failed: %s; transcript is still on clipboard for manual paste", e)
             return True  # text IS on clipboard; user can paste manually
     LOG.info("transcript copied to clipboard; press Ctrl+V (or Ctrl+Shift+V in terminals) to paste")
     return True
@@ -423,15 +460,15 @@ def _type_text_locked(text: str):
     if not text:
         return
     backend = TYPE_BACKEND
-    if backend == "auto":
+    if backend in ("auto", "direct", "no_clipboard"):
         # Prefer wtype (layout-aware) on wlroots-based compositors. GNOME/KDE do not
         # implement zwp_virtual_keyboard_v1, so wtype always fails there — skip straight
-        # to clipboard. ydotool last (assumes US layout).
+        # to ydotool for direct mode, or clipboard for auto mode.
         desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
         wtype_supported = not any(d in desktop for d in ("GNOME", "KDE"))
         if os.environ.get("WAYLAND_DISPLAY") and wtype_supported and shutil.which("wtype"):
             backend = "wtype"
-        elif shutil.which("wl-copy"):
+        elif backend == "auto" and shutil.which("wl-copy"):
             backend = "clipboard"
         elif shutil.which("ydotool"):
             backend = "ydotool"
@@ -442,14 +479,16 @@ def _type_text_locked(text: str):
     handlers = {"wtype": _try_wtype, "ydotool": _try_ydotool, "clipboard": _try_clipboard}
     handler = handlers.get(backend)
     if handler is None:
-        LOG.error("unknown DICTATION_TYPER=%r (use: auto|wtype|ydotool|clipboard)", backend)
+        LOG.error("unknown DICTATION_TYPER=%r (use: auto|direct|wtype|ydotool|clipboard)", backend)
         return
     if handler(text):
         return
     # Auto fallback chain on failure
-    if backend != "clipboard":
+    if backend != "clipboard" and ALLOW_CLIPBOARD_FALLBACK:
         LOG.info("falling back to clipboard")
         _try_clipboard(text)
+    elif backend != "clipboard":
+        LOG.error("direct typing failed and clipboard fallback is disabled")
 
 
 def _handle_ipc_client(conn: socket.socket) -> None:

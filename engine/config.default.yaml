@@ -93,6 +93,18 @@ dictation:
     - "stop take"
   append: " "
 
+mcp:
+  # Stdio MCP servers exposed to the assistant route (`hey lama`, `hey hermes`).
+  # The bundled local server provides `get_time` and `web_search`; add more
+  # servers here with the same command/args shape.
+  enabled: ${MCP_ENABLED:-true}
+  max_tool_rounds: 3
+  servers:
+    local:
+      command: ${MCP_LOCAL_COMMAND:-python3}
+      args:
+        - ${MCP_LOCAL_SCRIPT:-/usr/local/lib/whisper-bridge/local_mcp_server.py}
+
 tts:
   enabled: ${TTS_ENABLED:-true}
   voice_path: ${TTS_VOICE_PATH:-~/Models/tts/en/en_GB/alba/medium/en_GB-alba-medium.onnx}
@@ -109,8 +121,12 @@ agents:
     # set HERMES_API_KEY and it'll be sent as `Authorization: Bearer <key>`.
     api_key: ${HERMES_API_KEY:-}
     system_prompt: |
-      You are Hermes, a fast voice-controlled assistant. Reply in one or two sentences
-      unless the user explicitly asks for more.
+      You are Hermes, a fast voice assistant. Your replies are spoken
+      aloud with text-to-speech. Use plain spoken English. Keep answers brief unless
+      the user asks for detail. Do not use Markdown, bullet markers, asterisks,
+      code fences, tables, or decorative formatting. If giving a short list, write it
+      as a natural spoken sentence separated by commas or semicolons, not as bullets.
+      Never include the word "asterisk" to describe formatting.
     max_tokens: 256
     temperature: 0.7
 
@@ -119,6 +135,11 @@ agents:
     model: ${LLAMA_MODEL:-auto}
     api_key: ${LLAMA_API_KEY:-}      # set if llama.cpp was started with --api-key
     system_prompt: |
-      You are the local llama.cpp assistant. Reply briefly.
+      You are the local llama.cpp voice assistant. Your replies are spoken aloud with
+      text-to-speech. Use plain spoken English. Keep answers brief unless the user
+      asks for detail. Do not use Markdown, bullet markers, asterisks, code fences,
+      tables, or decorative formatting. If giving a short list, write it as a natural
+      spoken sentence separated by commas or semicolons, not as bullets. Never include
+      the word "asterisk" to describe formatting.
     max_tokens: 256
     temperature: 0.7

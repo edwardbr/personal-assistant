@@ -199,7 +199,9 @@ dictation.service`):
 | `DICTATION_TTS_VOICE_PATH` | `~/Models/tts/en/en_GB/alba/medium/en_GB-alba-medium.onnx` | Piper voice used for spoken assistant responses. |
 | `DICTATION_TTS_TOOLBOX` | `whisper-rocm-7.2.3` | Toolbox used for Piper if `piper` is not installed on the host. |
 | `DICTATION_TTS_ESPEAK_VOICE` | `en-gb` | Fallback `espeak-ng` voice if Piper is unavailable. |
-| `DICTATION_TYPER` | `auto` | `auto` / `wtype` / `ydotool` / `clipboard`. Force a specific backend. |
+| `DICTATION_TYPER` | `direct` | `auto` / `direct` / `wtype` / `ydotool` / `clipboard`. `direct` avoids the clipboard and uses direct key injection (`wtype` where supported, otherwise `ydotool`). |
+| `DICTATION_ALLOW_CLIPBOARD_FALLBACK` | `0` | When `0`, direct typing failures do not copy text to the clipboard. Set to `1` if you want clipboard fallback. |
+| `DICTATION_PASTE_KEYS` | `ctrl_v` | Clipboard backend paste shortcut. Use `ctrl_v` for editors and most GUI text fields; use `ctrl_shift_v` for terminals; `shift_insert` is also supported. |
 | `DICTATION_SOCKET_PATH` | `~/.cache/personal-assistant/dictation.sock` | Unix socket used by the wake bridge's `hey dictate` mode to ask `dictation.service` to type text into the focused window. |
 | `TYPE_DELAY_MS` | `5` | Per-character delay for `ydotool type` (only used when ydotool is the backend). |
 | `DICTATION_BEEPS` | `1` | `0` to silence the press/release tones. |
@@ -242,6 +244,7 @@ Pre-wired env knobs (with sensible defaults baked in):
 | `AUDIO_SAMPLE_RATE` | `48000` | `audio.sample_rate`. `48000` matches PipeWire and avoids the invalid-sample-rate errors seen with this USB mic. |
 | `AUDIO_MIN_RMS_DBFS` | `-42` | `audio.min_rms_dbfs`. Segments quieter than this are dropped before Whisper to reduce background-noise hallucinations. Raise it toward `-38` if noise still leaks through; lower it toward `-48` if quiet speech is missed. |
 | `DICTATION_SOCKET_PATH` | `~/.cache/personal-assistant/dictation.sock` | `dictation.socket_path`. Must match the daemon setting for `hey dictate`. |
+| `MCP_ENABLED` | `true` | `mcp.enabled`. Enables MCP tools for assistant wake routes such as `hey lama`. |
 | `TTS_ENABLED` | `true` | `tts.enabled` |
 | `TTS_VOICE_PATH` | `~/Models/tts/en/en_GB/alba/medium/en_GB-alba-medium.onnx` | `tts.voice_path` |
 | `DEFAULT_AGENT` | `hermes` | `default_agent` |
@@ -259,6 +262,11 @@ For Qwen-style llama.cpp models, the bridge sends
 `chat_template_kwargs.enable_thinking=false` by default so Piper reads only the
 final answer, not an empty response with hidden reasoning.
 
+The default agent prompts are written for spoken output: they ask the model to
+avoid Markdown, bullet markers, asterisks, tables, and code fences. The TTS path
+also strips common Markdown markers before sending text to Piper, so a bullet
+list is read as plain spoken sentences rather than as "asterisk" punctuation.
+
 The bridge also filters exact normalized transcripts listed in
 `wake_word_options.ignored_transcripts` before wake matching or dictation. This
 is where common Whisper-on-noise hallucinations such as `thank you` are blocked.
@@ -266,6 +274,42 @@ Repeated ignored phrases, such as `thank you thank you`, and repeated `beep`
 transcripts are filtered as well. If a dictation-start cue leaks into the same
 transcript as your first dictated words, the leading `beep` is stripped before
 typing.
+
+### MCP Tools
+
+The assistant wake routes (`hey lama`, `hey hermes`) can expose stdio MCP tools
+to the local model. The bundled local MCP server is enabled by default and
+provides:
+
+- `get_time` — current local date/time, with optional IANA timezone.
+- `web_search` — concise internet lookup via public web/Wikipedia endpoints.
+- `news_headlines` — current headlines from RSS feeds, with UK/world/topic
+  selection.
+
+Examples:
+
+```text
+hey lama what time is it
+hey lama look up the latest AMD Strix Halo news
+hey lama what are the news headlines in the United Kingdom
+```
+
+Add more stdio MCP servers under `mcp.servers` in
+`~/.config/whisper-bridge/config.yaml`:
+
+```yaml
+mcp:
+  enabled: true
+  max_tool_rounds: 3
+  servers:
+    local:
+      command: python3
+      args:
+        - /usr/local/lib/whisper-bridge/local_mcp_server.py
+    my_server:
+      command: /path/to/mcp-server
+      args: ["--flag", "value"]
+```
 
 ## Optional: Talon Voice
 
@@ -351,10 +395,10 @@ journalctl --user -u ydotoold.service -f
 **"no keyboards found"** — you're not in the `input` group. Run `id` to check;
 re-run `setup.sh` (it'll add you) and log out + back in.
 
-**Typing produces wrong characters** — `wtype` isn't being used (check the log for
-which backend it picked). Likely fallback to `ydotool` which assumes US layout.
-Confirm `wtype` is on `PATH`; if it is but failing, set
-`DICTATION_TYPER=clipboard` to fall through to the layout-agnostic path.
+**Typing produces wrong characters** — direct `ydotool type` assumes a US-style
+layout. The clipboard backend is layout-agnostic, but writes transcripts to the
+clipboard. Set `DICTATION_TYPER=clipboard` if layout correctness matters more
+than avoiding the clipboard.
 
 **Nothing happens when I press Right-Ctrl** — check that `dictation.service` is
 `active (running)`. Also check that something else (Mumble, Discord, a game)
@@ -381,9 +425,15 @@ and uses balanced defaults (`vad_aggressiveness: 2`, `min_speech_ms: 350`,
 `min_rms_dbfs: -42`). If noise still leaks through, raise `min_rms_dbfs` toward
 `-38` or add the exact unwanted phrase to `ignored_transcripts`.
 
-**Typing into a terminal pastes literal `^V`** — the daemon used the clipboard
-backend and the terminal interpreted Ctrl+Shift+V as something else. Set
-`DICTATION_TYPER=wtype` to force direct typing.
+**Dictation works in a terminal but not a text editor** — this repo's service
+defaults to `DICTATION_TYPER=direct`, which avoids the clipboard and should type
+into both terminals and editors through `ydotool`. If you switch back to the
+clipboard backend on GNOME Wayland, text editors expect `Ctrl+V`, while terminals
+expect `Ctrl+Shift+V`; control that with `DICTATION_PASTE_KEYS`.
+
+**Typing into a terminal pastes literal `^V` or does not paste** — set
+`DICTATION_PASTE_KEYS=ctrl_shift_v`, or set `DICTATION_TYPER=wtype` on a
+compositor that supports `wtype`.
 
 ## Stopping / disabling
 
