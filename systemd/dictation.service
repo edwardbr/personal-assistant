@@ -8,6 +8,7 @@ PartOf=graphical-session.target
 Type=simple
 Environment=WHISPER_URL=http://127.0.0.1:8771/v1/audio/transcriptions
 Environment=YDOTOOL_SOCKET=%t/.ydotool_socket
+Environment=DICTATION_SOCKET_PATH=%h/.cache/personal-assistant/dictation.sock
 ExecStart=%h/projects/personal-assistant/daemon/.venv/bin/python %h/projects/personal-assistant/daemon/dictation.py
 Restart=on-failure
 RestartSec=2

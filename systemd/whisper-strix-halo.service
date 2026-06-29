@@ -1,28 +1,49 @@
 [Unit]
 Description=Whisper STT toolbox (whisper-server on :8771, optional wake-word bridge)
-PartOf=graphical-session.target
 
 [Service]
 Type=simple
-# Server only by default. To also run the bridge (hey-hermes / hey-llama wake words):
-#   systemctl --user edit whisper-strix-halo.service
-# and add: Environment=WHISPER_RUN_BRIDGE=1
-Environment=WHISPER_RUN_BRIDGE=0
+PassEnvironment=XDG_RUNTIME_DIR PULSE_SERVER
+# This personal setup starts both whisper-server and the wake-word bridge.
+# Set WHISPER_RUN_BRIDGE=0 for server-only mode.
+Environment=WHISPER_RUN_BRIDGE=1
 Environment=WHISPER_MODEL=%h/Models/whisper-stt/ggml-large-v3-turbo.bin
+# PipeWire/Pulse source used by the wake-word bridge. Update with:
+#   pactl get-default-source
+Environment=AUDIO_DEVICE=pulse:alsa_input.usb-YC1006_YC1006-00.mono-fallback
+Environment=AUDIO_SAMPLE_RATE=48000
+Environment=AUDIO_MIN_RMS_DBFS=-42
+Environment=DICTATION_SOCKET_PATH=%h/.cache/personal-assistant/dictation.sock
 
 # `toolbox run` exec's into podman; we need to wait on the container's process, so use podman exec directly.
 ExecStartPre=/usr/bin/podman start whisper-rocm-7.2.3
 ExecStart=/bin/sh -c '\
   if [ "$WHISPER_RUN_BRIDGE" = "1" ]; then \
-    exec /usr/bin/podman exec -i whisper-rocm-7.2.3 whisper-toolbox-start ; \
+    exec /usr/bin/podman exec \
+      --user %u \
+      -e XDG_RUNTIME_DIR -e PULSE_SERVER -e HOME=/var/home/%u \
+      -e WHISPER_MODEL -e AUDIO_DEVICE -e AUDIO_SAMPLE_RATE -e AUDIO_MIN_RMS_DBFS \
+      -e DICTATION_SOCKET_PATH \
+      -i whisper-rocm-7.2.3 whisper-toolbox-start ; \
   else \
-    exec /usr/bin/podman exec -i whisper-rocm-7.2.3 \
+    exec /usr/bin/podman exec \
+      --user %u \
+      -e XDG_RUNTIME_DIR -e PULSE_SERVER -e HOME=/var/home/%u \
+      -e WHISPER_MODEL -e AUDIO_DEVICE -e AUDIO_SAMPLE_RATE -e AUDIO_MIN_RMS_DBFS \
+      -e DICTATION_SOCKET_PATH \
+      -i whisper-rocm-7.2.3 \
       whisper-server \
         -m "$WHISPER_MODEL" \
         --host 0.0.0.0 --port 8771 --threads 8 \
         --inference-path /v1/audio/transcriptions ; \
   fi'
-ExecStop=/usr/bin/podman exec whisper-rocm-7.2.3 sh -c 'pkill -TERM -f whisper-server; pkill -TERM -f bridge.py; true'
+ExecStop=/usr/bin/podman exec whisper-rocm-7.2.3 sh -c 'pkill -TERM -f "[b]ridge.py"; pkill -TERM -f "[p]arec"; pkill -TERM -f "[w]hisper-server"; pkill -TERM -f "[w]hisper-toolbox-start"; sleep 1; pkill -KILL -f "[b]ridge.py"; pkill -KILL -f "[p]arec"; pkill -KILL -f "[w]hisper-server"; pkill -KILL -f "[w]hisper-toolbox-start"; true'
+# whisper-server treats a second SIGTERM as "force immediate exit, status=1".
+# systemd's KillMode=control-group sends SIGTERM to the whole cgroup *after*
+# ExecStop runs, which triggers exactly that. Mask the resulting status=1 so
+# the unit ends in `inactive (dead)`, not `failed` (which would block restart
+# without `systemctl reset-failed`).
+SuccessExitStatus=1
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=30

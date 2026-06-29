@@ -30,8 +30,9 @@ cat <<EOF
    # inside the toolbox:
    rocminfo | grep -i gfx        # expect gfx1151
    pactl info | head             # expect "Server Name: PulseAudio (on PipeWire ...)"
-   arecord -l                    # expect your mic
-   whisper-toolbox-start         # starts whisper-server on :8771 and the hey-hermes bridge
+   pactl get-default-source      # expect your microphone source
+   pactl list short sources      # use pulse:<source-name> for AUDIO_DEVICE
+   whisper-toolbox-start         # starts whisper-server on :8771 and the wake-word bridge
 
    # from your host browser (or any other toolbox), the test web UI is at:
    #   http://localhost:8771/

@@ -5,10 +5,19 @@ Hands-free voice tooling on top of a local STT/TTS stack for AMD Strix Halo
 
 - **`engine/`** — the container-side stack: a podman/toolbox image built on
   ROCm 7.2.3 + whisper.cpp, with `whisper-server` (OpenAI-compatible STT) and
-  an optional wake-word bridge ("hey llama" / "hey hermes") that does TTS
-  replies via Piper.
+  a wake-word bridge ("hey llama" / "hey hermes") that does TTS replies via
+  Piper.
 - **`daemon/`** — a host-side push-to-talk daemon (`dictation.py`): hold
-  Right-Ctrl, speak, the transcript types into the focused window.
+  Right-Ctrl, speak, the transcript types into the focused window. Hold
+  Right-Ctrl + Right-Shift to ask the local llama.cpp assistant and hear a
+  spoken answer, with no UI.
+
+Optional add-on (see [Optional: Talon Voice](#optional-talon-voice) below):
+
+- **Talon Voice** — sibling toolbox (`engine/Dockerfile.talon`) for voice
+  *commands* (vs. prose dictation). Not required to use the rest of the
+  project; the chord can still be pointed back at Talon with
+  `DICTATION_CHORD_ACTION=talon`.
 
 ## How it fits
 
@@ -23,10 +32,13 @@ Hands-free voice tooling on top of a local STT/TTS stack for AMD Strix Halo
    ┌──────────────────────────┴───────────────────────────┐
    │                                                       │
 ┌──┴────────────────────┐   ┌──────────────────────────────┴───┐
-│ dictation.service     │   │ wake-word bridge (optional)       │
+│ dictation.service     │   │ wake-word bridge                  │
 │ Right-Ctrl PTT →      │   │ "hey llama" / "hey hermes"        │
 │   wtype into focused  │   │ → llama-server / Hermes VM        │
 │   window              │   │ → piper voice reply               │
+│ Right-Ctrl+Shift →    │   │                                  │
+│   llama.cpp → spoken  │   │                                  │
+│   TTS answer          │   │                                  │
 └───────────────────────┘   └──────────────────────────────────┘
 
 Also reachable from: Open WebUI (mic button), Hermes Agent (Ctrl+B in VM).
@@ -39,12 +51,12 @@ Also reachable from: Open WebUI (mic button), Hermes Agent (Ctrl+B in VM).
 | `daemon/dictation.py` | The PTT daemon. evdev keyboard hook + sounddevice mic + POST to whisper-server + wtype/ydotool/clipboard. |
 | `daemon/setup.sh` | Idempotent installer. Creates a venv, installs evdev/sounddevice/requests/numpy, lays down udev rule, registers + starts the three systemd-user services. |
 | `daemon/.venv/` | Created by `setup.sh`. Python deps for `dictation.py`. |
-| `engine/Dockerfile.whisper-rocm-7.2.3` | Toolbox image: Fedora 43 + ROCm 7.2.3 + gfx1151 HIP + whisper.cpp + Piper TTS. |
+| `engine/Dockerfile.whisper-rocm-7.2.3` | Toolbox image: Fedora 43 + ROCm 7.2.3 + gfx1151 HIP + whisper.cpp + Piper TTS. Includes `parec`/`paplay` for PipeWire/Pulse bridge capture and playback. |
 | `engine/build.sh` / `engine/create-toolbox.sh` | Build the image / register it as a toolbox with the right `/dev/dri`, `/dev/kfd`, `/dev/snd` device passthrough. |
 | `engine/entrypoint.sh` | Launched inside the container; starts `whisper-server`, then (optionally) the bridge. |
 | `engine/bridge.py` | Wake-word router: mic → whisper-server → wake-word match → `/v1/chat/completions` → Piper TTS reply. |
 | `engine/config.default.yaml` | Default bridge config (wake phrases, agent endpoints, TTS voice). Copy to `~/.config/whisper-bridge/config.yaml` to override without rebuilding. |
-| `systemd/whisper-strix-halo.service` | Autostarts the engine (whisper-server, plus bridge if `WHISPER_RUN_BRIDGE=1`) inside the `whisper-rocm-7.2.3` toolbox at login. |
+| `systemd/whisper-strix-halo.service` | Autostarts the engine (`whisper-server` plus the wake-word bridge) inside the `whisper-rocm-7.2.3` toolbox at login. |
 | `systemd/ydotoold.service` | Runs `ydotoold` as your user so `ydotool` works without root. |
 | `systemd/dictation.service` | Runs `daemon/dictation.py` from the venv. Depends on the above two. |
 
@@ -101,30 +113,69 @@ and outside the container):
   `~/Models/tts/en/en_GB/alba/medium/en_GB-alba-medium.onnx` plus its `.onnx.json`.
 
 The `whisper-strix-halo.service` unit auto-starts the container at login.
-By default it runs **`whisper-server` only** (the OpenAI-compatible STT
-endpoint on `:8771`). To also start the wake-word bridge, drop in:
+In this personal setup it runs both **`whisper-server`** (the OpenAI-compatible
+STT endpoint on `:8771`) and the wake-word bridge by default:
 
-```sh
-systemctl --user edit whisper-strix-halo.service
-# add:
-[Service]
+```ini
 Environment=WHISPER_RUN_BRIDGE=1
 ```
 
-Then `systemctl --user restart whisper-strix-halo.service`. The bridge reads
+Set `WHISPER_RUN_BRIDGE=0` in the unit for server-only mode. The bridge reads
 config from `~/.config/whisper-bridge/config.yaml` if present, else falls back
-to `engine/config.default.yaml`. Edit `wake_words`, `agents.*.url`, `tts.voice_path`,
-etc. to taste.
+to `engine/config.default.yaml`. Edit `wake_words`, `agents.*.url`,
+`tts.voice_path`, etc. to taste.
+
+On this machine the bridge uses the USB mic through PipeWire/Pulse:
+
+```ini
+Environment=AUDIO_DEVICE=pulse:alsa_input.usb-YC1006_YC1006-00.mono-fallback
+Environment=AUDIO_SAMPLE_RATE=48000
+```
+
+The `pulse:<source-name>` form tells `engine/bridge.py` to record with `parec`
+instead of raw PortAudio/ALSA, which avoids "device busy" failures when
+PipeWire owns the microphone. Find or update the source name with:
+
+```sh
+pactl get-default-source
+pactl list short sources
+```
 
 ## Daily use
 
 Hold **Right-Ctrl**, speak, release. The transcript types into whatever window has focus.
 
+Hold **Right-Ctrl + Right-Shift**, speak, release either key. The daemon
+transcribes what you said, sends it to the local llama.cpp endpoint at
+`http://127.0.0.1:3001/v1/chat/completions`, and speaks the answer back through
+Piper TTS. This path is headless; it does not use Talon or a browser UI.
+
+Say **"hey lama"** or **"hey llama"** to use the wake-word bridge. If you say
+only the wake phrase, wait for the beep and then speak the command within 12
+seconds. You can also speak it as one sentence, for example:
+
+```text
+hey lama can you hear me
+```
+
+Say **"hey dictate"** to start continuous hands-free dictation into the
+currently focused terminal, text box, or UI control. Each time you pause, the
+bridge transcribes that segment and sends it to `dictation.service`, which
+types it using the same backend as Right-Ctrl dictation. Say **"stop dictate"**
+to leave this mode.
+
 Audio cues:
 - 880 Hz pip on press = "recording started"
 - 660 Hz pip on release = "recording stopped, transcribing now"
+- 988 Hz pip on assistant chord = "assistant recording started"
+- 740 Hz pip on assistant release = "assistant is processing"
+- wake bridge beep after "hey lama" / "hey llama" = "assistant is armed"
+- wake bridge beep after "hey dictate" = "continuous dictation started"
+- wake bridge beep after "stop dictate" = "continuous dictation stopped"
 
-Then the text appears (typically <1 s for short phrases, <3 s for long).
+For Right-Ctrl, the text appears in the focused window (typically <1 s for
+short phrases, <3 s for long). For the assistant chord, the answer is spoken
+back instead.
 
 ## Configuration
 
@@ -136,7 +187,20 @@ dictation.service`):
 | `WHISPER_URL` | `http://127.0.0.1:8771/v1/audio/transcriptions` | Where to POST audio. Change if the whisper-server moves. |
 | `WHISPER_LANG` | `en` | Whisper language hint. |
 | `DICTATION_KEY` | `KEY_RIGHTCTRL` | evdev key name for PTT. Common picks: `KEY_RIGHTCTRL`, `KEY_RIGHTSHIFT`, `KEY_SCROLLLOCK`, `KEY_F12`, `KEY_CAPSLOCK`. Same effect as the `--key` CLI flag. |
+| `DICTATION_CHORD_KEY` | `KEY_RIGHTSHIFT` | Secondary key used with `DICTATION_KEY` for the assistant/Talon chord. Empty value disables the chord. |
+| `DICTATION_CHORD_ACTION` | `assistant` | `assistant` sends speech to llama.cpp and speaks the answer; `talon` restores the old Talon toggle; `none` disables the chord. |
+| `DICTATION_ASSISTANT_URL` | `http://127.0.0.1:3001/v1/chat/completions` | OpenAI-compatible chat endpoint for the headless assistant chord. |
+| `DICTATION_ASSISTANT_MODEL` | `auto` | `auto` selects the currently loaded llama.cpp model from `/v1/models`; set a model id to force one. |
+| `DICTATION_ASSISTANT_API_KEY` | _(empty)_ | Optional bearer token for the assistant endpoint. |
+| `DICTATION_ASSISTANT_MAX_TOKENS` | `256` | Maximum assistant response tokens. |
+| `DICTATION_ASSISTANT_TEMPERATURE` | `0.2` | Assistant response temperature. |
+| `DICTATION_ASSISTANT_DISABLE_THINKING` | `1` | Sends `chat_template_kwargs.enable_thinking=false` for Qwen-style llama.cpp models so TTS reads only the final answer. |
+| `DICTATION_ASSISTANT_TTS` | `1` | `0` disables spoken assistant responses. |
+| `DICTATION_TTS_VOICE_PATH` | `~/Models/tts/en/en_GB/alba/medium/en_GB-alba-medium.onnx` | Piper voice used for spoken assistant responses. |
+| `DICTATION_TTS_TOOLBOX` | `whisper-rocm-7.2.3` | Toolbox used for Piper if `piper` is not installed on the host. |
+| `DICTATION_TTS_ESPEAK_VOICE` | `en-gb` | Fallback `espeak-ng` voice if Piper is unavailable. |
 | `DICTATION_TYPER` | `auto` | `auto` / `wtype` / `ydotool` / `clipboard`. Force a specific backend. |
+| `DICTATION_SOCKET_PATH` | `~/.cache/personal-assistant/dictation.sock` | Unix socket used by the wake bridge's `hey dictate` mode to ask `dictation.service` to type text into the focused window. |
 | `TYPE_DELAY_MS` | `5` | Per-character delay for `ydotool type` (only used when ydotool is the backend). |
 | `DICTATION_BEEPS` | `1` | `0` to silence the press/release tones. |
 | `DICTATION_BEEP_VOLUME` | `0.15` | Tone volume (0.0 - 1.0). |
@@ -174,7 +238,10 @@ Pre-wired env knobs (with sensible defaults baked in):
 | `WHISPER_BRIDGE_URL` | `http://127.0.0.1:8771` | `whisper.url` |
 | `WHISPER_LANG` | `en` | `whisper.language` |
 | `BRIDGE_MODE` | `wake_word` | `mode` (`wake_word` / `vad_continuous` / `push_to_talk`) |
-| `AUDIO_DEVICE` | `default` | `audio.device` |
+| `AUDIO_DEVICE` | `default` | `audio.device`. Use `pulse:<source-name>` for PipeWire/Pulse capture through `parec`; this machine uses `pulse:alsa_input.usb-YC1006_YC1006-00.mono-fallback`. |
+| `AUDIO_SAMPLE_RATE` | `48000` | `audio.sample_rate`. `48000` matches PipeWire and avoids the invalid-sample-rate errors seen with this USB mic. |
+| `AUDIO_MIN_RMS_DBFS` | `-42` | `audio.min_rms_dbfs`. Segments quieter than this are dropped before Whisper to reduce background-noise hallucinations. Raise it toward `-38` if noise still leaks through; lower it toward `-48` if quiet speech is missed. |
+| `DICTATION_SOCKET_PATH` | `~/.cache/personal-assistant/dictation.sock` | `dictation.socket_path`. Must match the daemon setting for `hey dictate`. |
 | `TTS_ENABLED` | `true` | `tts.enabled` |
 | `TTS_VOICE_PATH` | `~/Models/tts/en/en_GB/alba/medium/en_GB-alba-medium.onnx` | `tts.voice_path` |
 | `DEFAULT_AGENT` | `hermes` | `default_agent` |
@@ -185,7 +252,91 @@ Anything else in the YAML can be templated the same way — wrap it in
 **Wake phrases / activation commands** live under `wake_words:` in the YAML —
 edit there to add aliases or new agents. The first phrase that matches a
 transcript wins, so put longer / more specific aliases first. Each entry maps
-to an `agents.<name>` block.
+to an `agents.<name>` block, except `action: dictate`, which starts continuous
+typing through `dictation.service` until a configured stop phrase is heard.
+
+For Qwen-style llama.cpp models, the bridge sends
+`chat_template_kwargs.enable_thinking=false` by default so Piper reads only the
+final answer, not an empty response with hidden reasoning.
+
+The bridge also filters exact normalized transcripts listed in
+`wake_word_options.ignored_transcripts` before wake matching or dictation. This
+is where common Whisper-on-noise hallucinations such as `thank you` are blocked.
+Repeated ignored phrases, such as `thank you thank you`, and repeated `beep`
+transcripts are filtered as well. If a dictation-start cue leaks into the same
+transcript as your first dictated words, the leading `beep` is stripped before
+typing.
+
+## Optional: Talon Voice
+
+Talon (talonvoice.com) is a voice-command engine — different shape from the
+Whisper dictation here: you speak structured commands ("camel my var name",
+"go line forty two") and Talon's grammar layer composes the keystrokes.
+
+This is **optional and additive** — none of the core dictation stack depends
+on it. Skip this section unless you specifically want command-mode voice
+control.
+
+### Phase 1 — container
+
+1. Sign up at <https://talonvoice.com> (free), grab the latest
+   Linux x86_64 tarball, save it as `~/Downloads/talon*linux*.tar.xz`
+   (any version-suffix or none works; the newest matching file wins).
+2. Build and register the toolbox:
+   ```sh
+   cd engine
+   ./build-talon.sh           # builds localhost/talon:latest (~250 MB)
+   ./create-talon-toolbox.sh  # registers toolbox `talon` with /dev/snd
+   ```
+3. Smoke-test:
+   ```sh
+   toolbox enter talon
+   talon                      # status window should appear on your desktop
+   ```
+
+Talon is closed-source but free to use. The community config
+(`talonhub/community`) is MIT and lives in `~/.talon/user/community/` once
+you clone it in there.
+
+### Phase 2 — chord activation
+
+`daemon/dictation.py` uses **Right-Ctrl + Right-Shift** for the headless
+llama.cpp assistant by default. To use that chord for Talon instead, set:
+
+```ini
+[Service]
+Environment=DICTATION_CHORD_ACTION=talon
+```
+
+With that override, holding both keys sends a `toggle` command over
+`~/.talon/chord.sock` to a small user script
+(`engine/talon-user/chord_listener.py`) loaded by Talon, which calls
+`actions.speech.toggle()`. Right-Ctrl alone still triggers prose dictation
+exactly as before; if Talon isn't running, the Talon chord is a silent no-op.
+
+Wire it up (after Phase 1 has produced `~/.talon/`):
+
+```sh
+cd engine
+./install-talon-integration.sh
+```
+
+That script:
+1. Symlinks `engine/talon-user/chord_listener.py` into `~/.talon/user/`
+2. Symlinks `systemd/talon.service` into `~/.config/systemd/user/`
+3. `enable --now` for `talon.service`
+4. Restarts `dictation.service` so it picks up the chord defaults
+
+Disable the chord without uninstalling Talon: `systemctl --user edit
+dictation.service` and add `Environment=DICTATION_CHORD_KEY=` (empty value).
+
+Files added by this phase:
+
+| Path | What it is |
+|---|---|
+| `engine/talon-user/chord_listener.py` | Talon user script: Unix-socket listener that calls `actions.speech.{toggle,enable,disable}` on `toggle` / `wake` / `sleep`. |
+| `systemd/talon.service` | Autostarts Talon inside the `talon` toolbox at login, mirroring `whisper-strix-halo.service`. |
+| `engine/install-talon-integration.sh` | One-shot wiring: symlinks + `systemctl enable --now`. |
 
 ## Logs
 
@@ -212,6 +363,23 @@ isn't owning `Right-Ctrl` as a global hotkey.
 **Audio is being recorded but transcript is empty** — usually means whisper-server
 isn't reachable. Try `curl -sI http://127.0.0.1:8771/`. If that fails,
 `systemctl --user restart whisper-strix-halo.service`.
+
+**"Hey lama" is recognized but you hear nothing** — check
+`journalctl --user -u whisper-strix-halo.service -f`. If the log shows
+`wake!` / `[llama] >>` but no sound, playback is the issue. The bridge uses
+`paplay` for the wake beep and Piper TTS, so verify `pactl info` works inside
+the toolbox and that `AUDIO_SAMPLE_RATE=48000`.
+
+**Wake bridge mic opens with `PortAudio error` or `Device or resource busy`** —
+set `AUDIO_DEVICE=pulse:<source-name>` in `systemd/whisper-strix-halo.service`
+and restart it. Get the source name with `pactl get-default-source`. This repo's
+unit is currently set to the USB mic source on this machine.
+
+**Wake bridge keeps hearing `Thank you` or other background-noise text** — the
+bridge filters common hallucinations in `wake_word_options.ignored_transcripts`
+and uses balanced defaults (`vad_aggressiveness: 2`, `min_speech_ms: 350`,
+`min_rms_dbfs: -42`). If noise still leaks through, raise `min_rms_dbfs` toward
+`-38` or add the exact unwanted phrase to `ignored_transcripts`.
 
 **Typing into a terminal pastes literal `^V`** — the daemon used the clipboard
 backend and the terminal interpreted Ctrl+Shift+V as something else. Set

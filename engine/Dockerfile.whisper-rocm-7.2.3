@@ -99,7 +99,10 @@ gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
 REPO
 EOF
 
-# runtime deps: rocm libs + audio client (PipeWire/Pulse) + python for the bridge.
+# runtime deps: rocm libs + audio clients + python for the bridge.
+# pulseaudio-utils provides `parec`/`paplay`, used by the wake-word bridge for
+# PipeWire/Pulse microphone capture and TTS/beep playback. PortAudio remains a
+# fallback for simpler raw-device setups.
 # python3-setuptools is required because webrtcvad imports pkg_resources at runtime
 # (Python 3.14 + fedora-minimal don't ship setuptools by default).
 # gcc/gcc-c++/python3-devel let users pip install other C-extension packages later;

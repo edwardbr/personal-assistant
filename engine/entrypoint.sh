@@ -37,7 +37,24 @@ whisper-server \
   --threads "$THREADS" \
   --inference-path "$INFERENCE_PATH" &
 WSERVER_PID=$!
-trap 'log "shutting down"; kill $WSERVER_PID 2>/dev/null || true' EXIT INT TERM
+BRIDGE_PID=""
+cleanup_done=0
+cleanup() {
+  if [[ "$cleanup_done" -eq 1 ]]; then
+    return
+  fi
+  cleanup_done=1
+  log "shutting down"
+  if [[ -n "${BRIDGE_PID:-}" ]]; then
+    kill "$BRIDGE_PID" 2>/dev/null || true
+  fi
+  kill "$WSERVER_PID" 2>/dev/null || true
+  if [[ -n "${BRIDGE_PID:-}" ]]; then
+    wait "$BRIDGE_PID" 2>/dev/null || true
+  fi
+  wait "$WSERVER_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
 
 log "waiting for whisper-server"
 ready=0
@@ -66,4 +83,6 @@ if [[ "$RUN_BRIDGE" != "1" ]]; then
 fi
 
 log "starting bridge (config=${CONFIG})"
-python3 /usr/local/lib/whisper-bridge/bridge.py --config "$CONFIG"
+python3 /usr/local/lib/whisper-bridge/bridge.py --config "$CONFIG" &
+BRIDGE_PID=$!
+wait "$BRIDGE_PID"

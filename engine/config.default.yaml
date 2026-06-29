@@ -19,17 +19,35 @@ whisper:
   translate: false
 
 audio:
-  device: ${AUDIO_DEVICE:-default}   # PortAudio device name or index; "default" = system default
-  sample_rate: 16000
+  # `default` and numeric/name values use PortAudio. `pulse:<source-name>` uses
+  # PipeWire/Pulse via `parec`, which avoids raw ALSA "device busy" failures on
+  # desktops where PipeWire owns the microphone. Find sources with:
+  #   pactl get-default-source
+  #   pactl list short sources
+  device: ${AUDIO_DEVICE:-default}
+  sample_rate: ${AUDIO_SAMPLE_RATE:-48000}
   vad_aggressiveness: 2              # 0-3, higher = more aggressive at filtering non-speech
-  silence_ms: 600                    # trailing silence that ends a segment
-  min_speech_ms: 300
+  silence_ms: 350                    # trailing silence that ends a segment
+  min_speech_ms: 350
+  min_rms_dbfs: ${AUDIO_MIN_RMS_DBFS:--42}
 
 wake_word_options:
   fuzzy: true                        # also match "hey, hermes" / "a hermes" / etc.
   ack_beep: true
   command_timeout_sec: 12
   print_response: true
+  # Exact normalized transcripts ignored before wake matching or dictation.
+  # These are common Whisper hallucinations from low speech/noise segments.
+  ignored_transcripts:
+    - "thank you"
+    - "thanks"
+    - "thanks for watching"
+    - "you"
+    - "mm"
+    - "hmm"
+    - "uh"
+    - "um"
+    - "beep"
 
 # Each wake phrase routes to a named agent below.
 # First wake word matched in a transcript wins; the rest of the segment (or the next
@@ -53,6 +71,27 @@ wake_words:
       - "hey llamas"
       - "hey lamas"
     agent: llama
+  - phrases:
+      - "hey dictate"
+      - "hey dictation"
+      - "start dictate"
+      - "start dictation"
+    action: dictate
+
+dictation:
+  # Used by the `action: dictate` wake word. The bridge sends each paused
+  # utterance to daemon/dictation.py, which types it into the focused window via
+  # the same backend as Right-Ctrl dictation.
+  socket_path: ${DICTATION_SOCKET_PATH:-~/.cache/personal-assistant/dictation.sock}
+  stop_phrases:
+    - "stop dictate"
+    - "stop dictating"
+    - "stop dictation"
+    - "stop dictated"
+    - "stop to take"
+    - "stop the take"
+    - "stop take"
+  append: " "
 
 tts:
   enabled: ${TTS_ENABLED:-true}

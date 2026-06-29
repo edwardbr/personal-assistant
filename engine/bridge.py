@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -39,6 +40,7 @@ class AgentProfile:
     max_tokens: int
     temperature: float
     api_key: str = ""   # if set, sent as `Authorization: Bearer <key>` (llama.cpp --api-key)
+    disable_thinking: bool = True
     _resolved_model: Optional[str] = field(default=None, init=False, repr=False)
 
     def auth_headers(self) -> dict:
@@ -48,7 +50,8 @@ class AgentProfile:
 @dataclass
 class WakeWord:
     phrases: list[str]   # accept multiple spellings to ride out whisper mishearings
-    agent: str
+    agent: str = ""
+    action: str = "agent"
 
     @property
     def display(self) -> str:
@@ -71,13 +74,18 @@ class Cfg:
     vad_aggressiveness: int
     silence_ms: int
     min_speech_ms: int
+    min_rms_dbfs: float
     wake_fuzzy: bool
     ack_beep: bool
     command_timeout_sec: float
     print_response: bool
+    ignored_transcripts: list[str]
     wake_words: list[WakeWord]
     agents: dict[str, AgentProfile]
     default_agent: str
+    dictation_socket_path: str
+    dictation_stop_phrases: list[str]
+    dictation_append: str
 
 
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
@@ -110,6 +118,7 @@ def load_config(path: str) -> Cfg:
             max_tokens=int(a.get("max_tokens", 256)),
             temperature=float(a.get("temperature", 0.7)),
             api_key=str(a.get("api_key", "") or ""),
+            disable_thinking=bool(a.get("disable_thinking", True)),
         )
 
     wake_words: list[WakeWord] = []
@@ -118,9 +127,17 @@ def load_config(path: str) -> Cfg:
             ph = [str(p).lower().strip() for p in w["phrases"] if str(p).strip()]
         else:
             ph = [str(w["phrase"]).lower().strip()]
-        wake_words.append(WakeWord(phrases=ph, agent=w["agent"]))
+        wake_words.append(
+            WakeWord(
+                phrases=ph,
+                agent=str(w.get("agent", "") or ""),
+                action=str(w.get("action", "agent") or "agent").lower().strip(),
+            )
+        )
     for w in wake_words:
-        if w.agent not in agents:
+        if w.action not in ("agent", "dictate"):
+            raise ValueError(f"wake_word {w.display!r} has unknown action {w.action!r}")
+        if w.action == "agent" and w.agent not in agents:
             raise ValueError(f"wake_word {w.display!r} -> unknown agent {w.agent!r}")
 
     default_agent = raw.get("default_agent")
@@ -130,6 +147,35 @@ def load_config(path: str) -> Cfg:
         default_agent = next(iter(agents))
 
     wo = raw.get("wake_word_options", {})
+    ignored_transcripts = [
+        normalize(str(p))
+        for p in wo.get(
+            "ignored_transcripts",
+            ["thank you", "thanks", "thanks for watching", "you", "mm", "hmm", "uh", "um", "beep"],
+        )
+        if normalize(str(p))
+    ]
+    dictation = raw.get("dictation", {}) or {}
+    dictation_socket_path = os.path.expanduser(
+        os.path.expandvars(
+            str(dictation.get("socket_path", "~/.cache/personal-assistant/dictation.sock"))
+        )
+    )
+    default_dictation_stop_phrases = [
+        "stop dictate",
+        "stop dictating",
+        "stop dictation",
+        "stop dictated",
+        "stop to take",
+        "stop the take",
+        "stop take",
+    ]
+    dictation_stop_phrases = [
+        str(p).lower().strip()
+        for p in dictation.get("stop_phrases", default_dictation_stop_phrases)
+        if str(p).strip()
+    ]
+    dictation_append = str(dictation.get("append", " "))
 
     tts = raw.get("tts", {}) or {}
     tts_enabled = bool(tts.get("enabled", False))
@@ -155,13 +201,18 @@ def load_config(path: str) -> Cfg:
         vad_aggressiveness=int(raw["audio"].get("vad_aggressiveness", 2)),
         silence_ms=int(raw["audio"].get("silence_ms", 600)),
         min_speech_ms=int(raw["audio"].get("min_speech_ms", 300)),
+        min_rms_dbfs=float(raw["audio"].get("min_rms_dbfs", -45.0)),
         wake_fuzzy=bool(wo.get("fuzzy", True)),
         ack_beep=bool(wo.get("ack_beep", True)),
         command_timeout_sec=float(wo.get("command_timeout_sec", 12)),
         print_response=bool(wo.get("print_response", True)),
+        ignored_transcripts=ignored_transcripts,
         wake_words=wake_words,
         agents=agents,
         default_agent=default_agent,
+        dictation_socket_path=dictation_socket_path,
+        dictation_stop_phrases=dictation_stop_phrases,
+        dictation_append=dictation_append,
         tts_enabled=tts_enabled,
         tts_voice_path=tts_voice_path,
         tts_sample_rate=tts_sample_rate,
@@ -169,7 +220,7 @@ def load_config(path: str) -> Cfg:
 
 
 def speak(cfg: Cfg, text: str):
-    """Synthesize via piper CLI and play through PortAudio. Half-duplex (blocks loop)."""
+    """Synthesize via piper CLI and play through Pulse/PipeWire. Half-duplex."""
     if not cfg.tts_enabled or not cfg.tts_voice_path:
         return
     text = text.strip()
@@ -195,11 +246,38 @@ def speak(cfg: Cfg, text: str):
     if not proc.stdout:
         LOG.warning("TTS: piper produced no audio")
         return
-    audio = np.frombuffer(proc.stdout, dtype=np.int16)
+    play_pcm(proc.stdout, cfg.tts_sample_rate, "TTS")
+
+
+def play_pcm(pcm: bytes, sample_rate: int, label: str) -> bool:
+    if not pcm:
+        return False
     try:
-        sd.play(audio, samplerate=cfg.tts_sample_rate, blocking=True)
+        subprocess.run(
+            [
+                "paplay",
+                "--raw",
+                "--format=s16le",
+                f"--rate={sample_rate}",
+                "--channels=1",
+            ],
+            input=pcm,
+            check=True,
+            timeout=30,
+        )
+        return True
+    except FileNotFoundError:
+        pass
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        LOG.warning("%s Pulse playback failed: %s", label, e)
+
+    audio = np.frombuffer(pcm, dtype=np.int16)
+    try:
+        sd.play(audio, samplerate=sample_rate, blocking=True)
+        return True
     except Exception as e:
-        LOG.warning("TTS playback failed: %s", e)
+        LOG.warning("%s playback failed: %s", label, e)
+        return False
 
 
 class SegmentCapture:
@@ -211,12 +289,18 @@ class SegmentCapture:
         self.frame_samples = int(cfg.sample_rate * FRAME_MS / 1000)
         self.silence_frames = max(1, cfg.silence_ms // FRAME_MS)
         self.min_speech_frames = max(1, cfg.min_speech_ms // FRAME_MS)
+        self.min_rms_dbfs = cfg.min_rms_dbfs
         self.stop_evt = threading.Event()
 
     def stop(self):
         self.stop_evt.set()
 
     def stream_segments(self):
+        device_name = str(self.cfg.audio_device)
+        if device_name == "pulse" or device_name.startswith("pulse:"):
+            yield from self._loop_frames(self._pulse_frames(device_name))
+            return
+
         device = None if self.cfg.audio_device == "default" else self.cfg.audio_device
         try:
             with sd.RawInputStream(
@@ -227,21 +311,54 @@ class SegmentCapture:
                 device=device,
             ) as stream:
                 LOG.info("mic open: device=%s rate=%d", device or "default", self.cfg.sample_rate)
-                yield from self._loop(stream)
+                yield from self._loop_frames(self._portaudio_frames(stream))
         except sd.PortAudioError as e:
             LOG.error("PortAudio error: %s", e)
             LOG.error("Check that the toolbox can see PipeWire/Pulse: pactl info && arecord -l")
             raise
 
-    def _loop(self, stream):
-        ring: collections.deque = collections.deque(maxlen=int(0.3 * self.cfg.sample_rate / self.frame_samples))
-        voiced: list[bytes] = []
-        silent_run = 0
-        triggered = False
+    def _portaudio_frames(self, stream):
         while not self.stop_evt.is_set():
             frame, overflowed = stream.read(self.frame_samples)
             if overflowed:
                 LOG.warning("input overflow")
+            yield bytes(frame)
+
+    def _pulse_frames(self, device_name: str):
+        source = device_name.partition(":")[2].strip()
+        cmd = [
+            "parec",
+            "--raw",
+            "--format=s16le",
+            f"--rate={self.cfg.sample_rate}",
+            "--channels=1",
+        ]
+        if source:
+            cmd.append(f"--device={source}")
+        LOG.info("mic open: device=%s rate=%d via parec", source or "pulse", self.cfg.sample_rate)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        try:
+            if proc.stdout is None:
+                return
+            frame_bytes = self.frame_samples * SAMPLE_WIDTH
+            while not self.stop_evt.is_set():
+                frame = proc.stdout.read(frame_bytes)
+                if not frame:
+                    break
+                yield frame
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def _loop_frames(self, frames):
+        ring: collections.deque = collections.deque(maxlen=int(0.3 * self.cfg.sample_rate / self.frame_samples))
+        voiced: list[bytes] = []
+        silent_run = 0
+        triggered = False
+        for frame in frames:
             if len(frame) < self.frame_samples * SAMPLE_WIDTH:
                 continue
             try:
@@ -263,11 +380,32 @@ class SegmentCapture:
                     silent_run += 1
                     if silent_run >= self.silence_frames:
                         if len(voiced) >= self.min_speech_frames:
-                            yield b"".join(voiced)
+                            segment = b"".join(voiced)
+                            dbfs = pcm_dbfs(segment)
+                            if dbfs >= self.min_rms_dbfs:
+                                yield segment
+                            else:
+                                LOG.debug(
+                                    "skip quiet segment: %.1f dBFS < %.1f dBFS",
+                                    dbfs,
+                                    self.min_rms_dbfs,
+                                )
                         triggered = False
                         voiced = []
                         silent_run = 0
                         ring.clear()
+
+
+def pcm_dbfs(pcm: bytes) -> float:
+    if not pcm:
+        return -120.0
+    audio = np.frombuffer(pcm, dtype=np.int16)
+    if audio.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+    if rms <= 0.0:
+        return -120.0
+    return 20.0 * np.log10(rms / 32768.0)
 
 
 def pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
@@ -304,6 +442,63 @@ def normalize(text: str) -> str:
     return _WAKE_NORM.sub(" ", text.lower()).strip()
 
 
+def _phrase_pattern(phrase: str) -> str:
+    parts = [re.escape(part) for part in normalize(phrase).split()]
+    return r"\b" + r"[^a-z0-9]*".join(parts) + r"\b"
+
+
+def original_tail_after_phrase(text: str, phrases: list[str]) -> str:
+    best: Optional[re.Match[str]] = None
+    for phrase in phrases:
+        pattern = _phrase_pattern(phrase)
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m and (best is None or m.start() < best.start()):
+            best = m
+    return text[best.end():].strip() if best else ""
+
+
+def split_before_phrase(text: str, phrases: list[str]) -> tuple[str, bool]:
+    best: Optional[re.Match[str]] = None
+    for phrase in phrases:
+        pattern = _phrase_pattern(phrase)
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m and (best is None or m.start() < best.start()):
+            best = m
+    if best is None:
+        return text, False
+    return text[:best.start()].strip(), True
+
+
+def clean_dictation_text(text: str) -> str:
+    """Drop leading audio-cue words if the start beep leaks into Whisper."""
+    return re.sub(r"^\s*(?:beep[\s,.;:!?-]*)+", "", text, flags=re.IGNORECASE).strip()
+
+
+def should_ignore_transcript(cfg: Cfg, text: str) -> bool:
+    n = normalize(text)
+    if not n:
+        return True
+    ignored = set(cfg.ignored_transcripts)
+    if n in ignored:
+        return True
+    words = n.split()
+    if words and all(word == "beep" for word in words):
+        return True
+    for phrase in ignored:
+        phrase_words = phrase.split()
+        if (
+            phrase_words
+            and len(words) > len(phrase_words)
+            and len(words) % len(phrase_words) == 0
+            and all(
+                words[i : i + len(phrase_words)] == phrase_words
+                for i in range(0, len(words), len(phrase_words))
+            )
+        ):
+            return True
+    return False
+
+
 def find_wake_match(text: str, wake_words: list[WakeWord], fuzzy: bool):
     """Return (end_index_in_normalized_text, WakeWord) of the earliest matching wake phrase, or None.
     Tries every phrase variant in each WakeWord; first phrase to hit (earliest start) wins.
@@ -330,6 +525,31 @@ def find_wake_match(text: str, wake_words: list[WakeWord], fuzzy: bool):
     if best is None:
         return None
     return best[1], best[2]
+
+
+def send_dictation_text(cfg: Cfg, text: str) -> bool:
+    text = clean_dictation_text(text)
+    if should_ignore_transcript(cfg, text):
+        return True
+    if cfg.dictation_append and not text.endswith((" ", "\n", "\t")):
+        text += cfg.dictation_append
+    payload = {"command": "type", "text": text}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect(cfg.dictation_socket_path)
+            s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            response = s.makefile("rb").readline()
+        if not response:
+            LOG.warning("dictation IPC returned no response")
+            return False
+        result = json.loads(response.decode("utf-8"))
+        if result.get("ok"):
+            return True
+        LOG.warning("dictation IPC failed: %s", result.get("error"))
+    except Exception as e:
+        LOG.warning("dictation IPC failed: %s", e)
+    return False
 
 
 def resolve_agent_model(agent: AgentProfile) -> str:
@@ -372,18 +592,26 @@ def call_agent(agent: AgentProfile, user_text: str) -> str:
         "temperature": agent.temperature,
         "stream": False,
     }
+    if agent.disable_thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     r = requests.post(agent.url, json=payload, headers=agent.auth_headers(), timeout=120)
     r.raise_for_status()
     j = r.json()
-    return j["choices"][0]["message"]["content"].strip()
+    msg = j["choices"][0]["message"]
+    answer = (msg.get("content") or "").strip()
+    if answer:
+        return answer
+    if msg.get("reasoning_content"):
+        LOG.warning("[%s] agent returned reasoning but no final answer", agent.name)
+    return ""
 
 
 def beep():
     try:
-        rate = 16000
+        rate = 48000
         t = np.linspace(0, 0.12, int(rate * 0.12), endpoint=False)
-        tone = (0.25 * np.sin(2 * np.pi * 880 * t)).astype(np.float32)
-        sd.play(tone, samplerate=rate, blocking=True)
+        tone = (0.25 * 32767 * np.sin(2 * np.pi * 880 * t)).astype(np.int16)
+        play_pcm(tone.tobytes(), rate, "beep")
     except Exception:
         pass
 
@@ -402,12 +630,14 @@ def handle_command(cfg: Cfg, agent: AgentProfile, user_text: str):
 
 def run_wake_word(cfg: Cfg, cap: SegmentCapture):
     phrases = "; ".join(
-        f"{w.display}({len(w.phrases)} variants)->{w.agent}" for w in cfg.wake_words
+        f"{w.display}({len(w.phrases)} variants)->{w.agent if w.action == 'agent' else w.action}"
+        for w in cfg.wake_words
     )
     LOG.info("mode=wake_word listening for %s", phrases)
 
     armed_until: float = 0.0
     armed_agent: Optional[AgentProfile] = None
+    dictating = False
     for pcm in cap.stream_segments():
         t0 = time.monotonic()
         try:
@@ -416,20 +646,53 @@ def run_wake_word(cfg: Cfg, cap: SegmentCapture):
             LOG.warning("transcribe failed: %s", e)
             continue
         dt = time.monotonic() - t0
-        if not text:
+        if should_ignore_transcript(cfg, text):
+            if text:
+                LOG.debug("ignored transcript (%.2fs): %s", dt, text)
             continue
-        LOG.info("heard (%.2fs): %s", dt, text)
 
         now = time.monotonic()
+        if dictating:
+            LOG.info("heard (%.2fs): %s", dt, text)
+            dictation_text, should_stop = split_before_phrase(text, cfg.dictation_stop_phrases)
+            if dictation_text and not should_ignore_transcript(cfg, dictation_text):
+                LOG.info("[dictate] >> %s", dictation_text)
+                send_dictation_text(cfg, dictation_text)
+            if should_stop:
+                dictating = False
+                LOG.info("dictation stopped")
+                if cfg.ack_beep:
+                    beep()
+            continue
+
         armed = now < armed_until and armed_agent is not None
 
         if not armed:
             match = find_wake_match(text, cfg.wake_words, cfg.wake_fuzzy)
             if match is None:
+                LOG.debug("unmatched transcript (%.2fs): %s", dt, text)
                 continue
+            LOG.info("heard (%.2fs): %s", dt, text)
             end, ww = match
+            tail = original_tail_after_phrase(text, ww.phrases)
+            if ww.action == "dictate":
+                dictating = True
+                LOG.info("dictation started; stop phrases=%s", ", ".join(cfg.dictation_stop_phrases))
+                if cfg.ack_beep:
+                    beep()
+                if tail:
+                    dictation_text, should_stop = split_before_phrase(tail, cfg.dictation_stop_phrases)
+                    if dictation_text and not should_ignore_transcript(cfg, dictation_text):
+                        LOG.info("[dictate] >> %s", dictation_text)
+                        send_dictation_text(cfg, dictation_text)
+                    if should_stop:
+                        dictating = False
+                        LOG.info("dictation stopped")
+                        if cfg.ack_beep:
+                            beep()
+                continue
+
             agent = cfg.agents[ww.agent]
-            tail = normalize(text)[end:].strip()
             if tail:
                 handle_command(cfg, agent, tail)
                 continue
@@ -442,6 +705,7 @@ def run_wake_word(cfg: Cfg, cap: SegmentCapture):
             continue
 
         # already armed -> this segment is the command for the armed agent
+        LOG.info("heard (%.2fs): %s", dt, text)
         agent = armed_agent
         armed_until = 0.0
         armed_agent = None
@@ -457,7 +721,9 @@ def run_vad_continuous(cfg: Cfg, cap: SegmentCapture):
         except Exception as e:
             LOG.warning("transcribe failed: %s", e)
             continue
-        if not text:
+        if should_ignore_transcript(cfg, text):
+            if text:
+                LOG.debug("ignored transcript: %s", text)
             continue
         LOG.info("heard: %s", text)
         handle_command(cfg, agent, text)
@@ -478,7 +744,9 @@ def run_push_to_talk(cfg: Cfg, cap: SegmentCapture):
         except Exception as e:
             LOG.warning("transcribe failed: %s", e)
             continue
-        if not text:
+        if should_ignore_transcript(cfg, text):
+            if text:
+                LOG.debug("ignored transcript: %s", text)
             continue
         LOG.info("heard: %s", text)
         handle_command(cfg, agent, text)

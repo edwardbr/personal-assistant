@@ -1,0 +1,32 @@
+[Unit]
+Description=Talon Voice toolbox (sibling of whisper-strix-halo)
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# GDM imports DISPLAY/WAYLAND_DISPLAY/XAUTHORITY/... into the user systemd manager
+# at login (`systemctl --user import-environment ...`). PassEnvironment forwards
+# those values into this unit's env so the toolbox wrapper can find them.
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS PULSE_SERVER
+
+ExecStartPre=/usr/bin/podman start talon
+# Forward each PassEnvironment var into the container with `-e VAR` (value comes
+# from this unit's env). XAUTHORITY is the critical one for X11/XWayland; without
+# it, Talon hits "Authorization required, but no authorization protocol specified".
+# `toolbox run` was tried here but doesn't propagate XAUTHORITY when invoked from
+# a non-interactive context (e.g. systemd user unit) -- explicit -e is the
+# reliable form.
+ExecStart=/usr/bin/podman exec \
+    --user %U:%G \
+    -e DISPLAY -e WAYLAND_DISPLAY -e XAUTHORITY \
+    -e XDG_RUNTIME_DIR -e XDG_SESSION_TYPE \
+    -e DBUS_SESSION_BUS_ADDRESS -e PULSE_SERVER \
+    -e HOME=/var/home/%u \
+    -i talon talon
+ExecStop=/usr/bin/podman exec talon sh -c 'pkill -TERM -f /opt/talon/talon; true'
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+
+[Install]
+WantedBy=graphical-session.target
